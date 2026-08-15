@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 _ENCODER = {"h264": "libx264", "h265": "libx265"}
+_MUXER = {"h264": "h264", "h265": "hevc"}  # raw-bitstream muxer (NOT "264"/"265")
 
 
 def ffmpeg_available() -> bool:
@@ -74,7 +75,7 @@ class StandardCodec:
                     "-c:v", _ENCODER[self.codec],
                     "-preset", self.preset, "-qp", str(qp),
                     "-pix_fmt", "yuv420p",
-                    "-f", _ENCODER[self.codec].replace("libx", ""),
+                    "-f", _MUXER[self.codec],
                     str(bitstream),
                 ],
                 input=clip.tobytes(),
