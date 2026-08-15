@@ -36,7 +36,7 @@ train:
   real_codec_name: h265   # h264 | h265
   real_codec_preset: medium
   qp_list: [22, 27, 32, 37, 42]
-  qp_to_quality: {22: 8, 27: 5, 32: 3, 37: 2, 42: 1}
+  qp_to_quality: {22: 5, 27: 3, 32: 2, 37: 1, 42: 1}   # tuned so proxy bpp ~ x265 bpp
   real_codec_every_n_steps: 1
   calibration: none       # none (Phase 1) | rate (Phase 2, not implemented)
 
