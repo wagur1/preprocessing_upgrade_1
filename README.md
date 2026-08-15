@@ -1,182 +1,180 @@
-# A Preprocessing Framework for Video Machine Vision under Compression
+# Preprocessing for Video Machine Vision — Upgrade 1 (train on the real x265 codec)
 
-A faithful, runnable implementation of the framework from *"A Preprocessing
-Framework for Video Machine Vision under Compression"* (Zhao et al.) — **with the
-paper's hand-crafted differentiable "virtual codec" replaced by
-[CompressAII](https://github.com/InterDigitalInc/CompressAI)**.
+Fork của [`preprocessing_final`](https://github.com/wagur1/preprocessing_final) (bản dựng lại
+Zhao et al., *"A Preprocessing Framework for Video Machine Vision under Compression"*,
+với "virtual codec" của paper thay bằng CompressAI `bmshj2018-factorized`).
 
-A small neural **preprocessor** edits each video *before* compression so that a
-frozen downstream vision model (action recognition / tracking) survives the
-codec at far lower bitrate, while keeping the coded video close to the original.
+**Điểm mới của bản này:** preprocessor được **train với forward đi qua codec x265 THẬT**
+(ffmpeg libx265), còn **gradient chảy qua proxy CompressAI khả vi** — vá thẳng điểm yếu
+W3 (lệch proxy↔codec thật) của baseline. Kỹ thuật: **Straight-Through Estimator (STE) /
+detached-difference**. Pipeline giữ nguyên, chỉ đổi vòng train.
 
 ```
  video ─▶ Preprocessor ─▶ Codec ─▶ reconstruction ─▶ frozen Analyzer ─▶ task
-          (trained)       (frozen)                    (frozen)
-             ▲                │                            │
-             └──── gradients ─┴──── L = α(L_D + λ·L_R) + L_Acc ◀───────┘
+          (trained)       │                           (frozen)           │
+             ▲            │                                              │
+             │       train:  x265 THẬT (forward)  +  CompressAI proxy (gradient)
+             │       eval :  range coder thật + anchor H.264/H.265
+             └──── gradients ──── L = α(L_D + λ·L_R) + L_Acc ◀───────────┘
 ```
 
-Only the preprocessor is trained; gradients flow **through** the frozen codec
-and analyzer back into it.
+Chỉ preprocessor được train; codec và analyzer đông cứng.
 
-## Why CompressAI replaces the virtual codec
+## Cải tiến chính — STE: forward = x265 thật, backward = proxy
 
-The paper hand-builds a differentiable "virtual codec" (intra/inter prediction →
-transform → quantize → inverse, plus a **factorized-prior rate estimate à la
-Ballé et al.**) purely to give the preprocessor a differentiable
-rate + distortion signal during training.
+x265 không khả vi nên không thể backprop trực tiếp. Trick detached-difference:
+giá trị forward lấy từ codec thật, đạo hàm mượn từ proxy.
 
-CompressAI's `bmshj2018-factorized` model **is** that Ballé-et-al. factorized-prior
-codec, already trained and battle-tested. So it provides the exact same
-supervision, but better:
+```python
+qp   = random.choice(qp_list)          # SAMPLE QP TRƯỚC pre()
+q    = qp_to_quality[qp]               # map QP → CompressAI quality index
+x_pre = pre(clips)
 
-| | training | evaluation |
-|---|---|---|
-| **reconstruction** | differentiable `x_hat` (additive-noise quantization) | real range coder (`compress`/`decompress`) |
-| **rate** | estimated bpp from entropy-model likelihoods | **actual** coded bpp |
+x_hat_prx, bpp_prx = codec(x_pre, q)                    # proxy khả vi
+if real_step:                                           # mỗi real_codec_every_n_steps
+    x_hat_real, bpp_real = real_codec(x_pre, qp)        # x265 thật, no_grad
+    x_hat = x_hat_prx + (x_hat_real - x_hat_prx).detach()   # forward=thật, grad qua proxy
+    bpp   = bpp_prx   + (bpp_real_t - bpp_prx ).detach()
+else:
+    x_hat, bpp = x_hat_prx, bpp_prx                     # fallback proxy-only
+```
 
-→ gradients during training, honest bitrates when reporting results.
+Bất biến: `x_hat == x_hat_real` (forward), `∂x_hat/∂x_pre = ∂x_hat_prx/∂x_pre` (backward).
+Helper `_straight_through` ở `src/engine.py`; áp cho **cả hai** vòng `_train_classification`
+và `_train_tracking`. Không có ffmpeg → tự cảnh báo và fallback proxy-only, không crash.
 
-## The objective (paper Eq. 1)
+## Bảng cải thiện so với baseline (`preprocessing_final`)
+
+| # | Phần | Baseline `final1` | Upgrade1 | Vá điểm yếu | Trạng thái |
+|---|------|-------------------|----------|-------------|-----------|
+| 1 | **Forward codec lúc train** | Chỉ proxy CompressAI khả vi | **x265 thật** qua STE (`_training_codec_forward`) | **W3** proxy↔real mismatch | ✅ đã code (Phase 1) |
+| 2 | **Gradient** | Qua proxy | Qua proxy, giữ nguyên (STE) | — | ✅ đã code |
+| 3 | **Thứ tự sample QP** | `pre()` chạy trước, `q` chọn sau → mù rate | **Sample QP TRƯỚC `pre()`**, map `qp→q` | tiền đề **W2** (FiLM là PR sau) | ✅ đã code |
+| 4 | **QP↔quality mapping** | Không có | `qp_to_quality` đơn điệu, validate ở `_training_codec_setup` | — | ✅ đã code |
+| 5 | **Lỗi cú pháp `_train_classification`** | Thiếu header vòng lặp → `IndentationError` | Khôi phục `for epoch / pbar / for clips,labels` | bug | ✅ đã sửa |
+| 6 | **Guard ffmpeg + amortize** | — | `ffmpeg_available()` fallback; `real_codec_every_n_steps` | chi phí | ✅ đã code |
+| 7 | **Log chênh bitrate** | — | log `bpp_proxy` vs `bpp_real` + `gap%` mỗi 200 step | tinh chỉnh map | ✅ đã code |
+| 8 | **Proxy calibration (trainable)** | — | `L_rate_cal`, `opt_proxy` two-timescale | **W3** đầy đủ (A3) | ⏳ Phase 2, CHƯA code |
+| 9 | **FiLM QP-conditioning vào preprocessor** | — | `pre(clips, qp)` | **W2** | ⏳ ngoài scope PR này |
+
+Các phần **không đổi** so với baseline (data loaders, metrics BD-Rate/AUC/top-1, tasks,
+preprocessor, eval end-to-end) được giữ nguyên — bản này chỉ *extend* vòng train.
+Chi tiết kế hoạch: [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) (cho Codex),
+[`PAPER_PLAN.md`](PAPER_PLAN.md) (roadmap Q1, W1–W9, Tier A/B/C).
+
+## Hàm loss (giữ nguyên paper Eq. 1)
 
 ```
 L = α · (L_D + λ · L_R) + L_Acc          α = 10,  λ = 0.001
 ```
-* `L_D` distortion — MSE(reconstruction, **source** video)
-* `L_R` rate — estimated bits-per-pixel from the codec's entropy model
-* `L_Acc` task loss — from the frozen analyzer: cross-entropy (action
-  recognition) or the SiamFC balanced-logistic response loss (tracking)
+`L_D` = MSE(recon, **source**); `L_R` = bpp; `L_Acc` = cross-entropy (AR) hoặc
+SiamFC balanced-logistic (tracking). Bản STE **không đổi** `losses.py` — chỉ đổi
+`x_hat/bpp` đầu vào (giờ mang giá trị x265 thật).
 
-## The preprocessor (paper Fig. 2)
+## Config mới (dưới `train:` trong cả hai file `configs/*.yaml`)
 
-Two-branch residual network:
-* **temporal branch** — 3D convs spanning frames (inter-frame context),
-* **spatial branch** — per-frame 2D convs (intra-frame context),
-* **conditional attention** fuses the two streams,
-* **residual** output `x + Δ` (last conv zero-initialised → starts as identity).
+```yaml
+train:
+  real_codec: true              # bật STE forward thật
+  real_codec_name: h265         # h264 | h265
+  real_codec_preset: medium
+  qp_list: [22, 27, 32, 37, 42]
+  qp_to_quality: {22: 8, 27: 5, 32: 3, 37: 2, 42: 1}   # đơn điệu: QP↑ ↔ quality↓
+  real_codec_every_n_steps: 1   # >1 để amortize chi phí ffmpeg
+  calibration: none             # none (Phase 1) | rate (Phase 2, CHƯA implement → raise nếu set)
+```
+`codec.qualities` đã mở rộng `[1,2,3,5,8]` để phủ mọi giá trị trong `qp_to_quality`.
 
-## Tasks
+## Tasks & Evaluation (giữ nguyên baseline)
 
-| task | analyzer | metric | status |
-|------|----------|--------|--------|
-| **Action recognition** (Kinetics-400) | frozen `r3d_18` (torchvision, Kinetics-400 weights) | top-1 accuracy | fully wired & runnable |
-| **Object tracking** (GOT-10k) | frozen SiamFC (`resnet18` backbone); optional pytracking KYS/DiMP/ATOM/PrDiMP | success-plot AUC (+AO, SR) | fully wired & runnable |
+| task | analyzer | metric |
+|------|----------|--------|
+| Action recognition (Kinetics-400) | frozen `r3d_18` | top-1 |
+| Object tracking (GOT-10k val) | frozen SiamFC; optional pytracking DiMP/ATOM/KYS/PrDiMP | success AUC (+AO, SR) |
 
-Both tasks run end-to-end on ≤3 GB data. **Tracking** uses the GOT-10k **val**
-split (ground-truth boxes on every frame): the preprocessor is trained with
-SiamFC's differentiable balanced-logistic loss on the *compressed* clip, and
-evaluation runs the tracker over each sequence to report the **real success AUC**
-at every rate point. The default tracker is a self-contained SiamFC (frozen
-ImageNet backbone, no extra install). For the paper's exact trackers
-(KYS/DiMP/ATOM/PrDiMP), install [pytracking](https://github.com/visionml/pytracking)
-(`scripts/install_pytracking.sh`) and set `task.tracker: pytracking:dimp:dimp50`
-in the config — training still uses the differentiable SiamFC loss. See
-`src/tasks/siamfc.py`, `src/tasks/tracking.py`, `src/tasks/pytracking_adapter.py`.
+`evaluate.py` vẽ **rate-accuracy curve** với range coder thật, so 4 pipeline —
+`prep+compressai` (đề xuất), `compressai` (ablation), `h264`, `h265` (anchor) — rồi
+báo **BD-Rate** của `prep+compressai` vs từng anchor (âm = tiết kiệm bit ở cùng accuracy).
+Output: `results.json`, `curves.csv`, `rate_accuracy.png`. **Eval không đổi** so với baseline.
 
-## Evaluation
+## Chạy trên Kaggle (cụ thể)
 
-`evaluate.py` traces **rate-accuracy curves** with the real coders and compares:
+Cần **GPU** + **Internet ON** (để `pip install` và tải trọng số). Kaggle image có sẵn
+`ffmpeg` (libx264/libx265) → nhánh x265-thật lúc train hoạt động; nếu image nào thiếu,
+code tự fallback proxy-only kèm cảnh báo (không crash).
 
-* `prep+compressai` — the proposed method,
-* `compressai` — CompressAI alone (ablation: what the preprocessor adds),
-* `h264` — bare H.264 (ffmpeg libx264), the anchor,
-* `h265` — bare H.265 (ffmpeg libx265), the anchor,
+```python
+# 1) Kéo repo + cài deps
+!git clone https://github.com/wagur1/preprocessing_upgrade_1.git
+%cd preprocessing_upgrade_1
+!pip install -q compressai            # torch/torchvision đã có sẵn trên Kaggle
+!ffmpeg -version | head -1            # xác nhận có libx265
 
-then reports **BD-Rate** (Bjøntegaard) of `prep+compressai` against each anchor,
-where the "quality" axis is the task metric (top-1 accuracy for action
-recognition, success AUC for tracking) instead of PSNR. Negative BD-Rate =
-fewer bits for the same accuracy = win.
+# 2A) Action recognition (Kinetics 5%) — one-shot: prepare index → train → eval
+!python kaggle/run_kaggle.py \
+    --config configs/action_recognition.yaml \
+    --cap-gb 3 --epochs 3 --max-steps 300
 
-Outputs: `results.json` (carries `task` + `metric`), `curves.csv`,
-`rate_accuracy.png`.
+# 2B) Object tracking (GOT-10k val)
+!python kaggle/run_kaggle.py \
+    --config configs/tracking.yaml \
+    --cap-gb 3 --epochs 3 --max-steps 300 \
+    --max-seqs 30 --max-frames 48
+```
+
+Dataset AR: [`rohanmallick/kinetics-train-5per`](https://www.kaggle.com/datasets/rohanmallick/kinetics-train-5per)
+(add vào Input của notebook). Cap 3 GB bằng *indexing* round-robin, không copy.
+`run_kaggle.py` tự: build index → `train.py` → `evaluate.py`, ghi vào `outputs/`.
+Flags: `--epochs --max-steps --cap-gb --frame-size --batch-size --max-seqs --max-frames
+--skip-prepare --skip-train --ckpt`.
+
+**Lưu ý chi phí (quan trọng):** `real_codec_every_n_steps: 1` = MỖI step gọi 1 subprocess
+ffmpeg/clip → chậm. Smoke test nên tăng lên `4` (mở `configs/*.yaml`, sửa key này) để
+step khác dùng proxy-only. Theo dõi log `bpp_proxy vs bpp_real gap%` (mỗi 200 step): nếu
+`gap` lớn kéo dài, chỉnh `qp_to_quality` cho khớp điểm rate hơn.
+
+## Kiểm chứng (không cần GPU)
+
+```bash
+python -m compileall src/            # bắt lỗi cú pháp (đặc biệt _train_classification)
+python tests/test_ste.py             # STE self-check, không framework
+```
+`tests/test_ste.py` assert: (a) `x_hat == x_hat_real` (forward = thật); (b) sau backward,
+`x_pre.grad` = grad qua proxy, KHÔNG qua real; (c) `qp_to_quality` đơn điệu.
 
 ## Layout
 
 ```
 src/
-  models/
-    preprocessor.py     two-branch neural preprocessor (trained)
-    codec.py            CompressAI wrapper  ← replaces the virtual codec
-  tasks/
-    base.py             frozen-analyzer interface + factory
-    action_recognition.py   r3d_18 (Kinetics-400)
-    siamfc.py           self-contained SiamFC tracker (differentiable loss + inference)
-    tracking.py         SiamFC analyzer (GOT-10k)
-    pytracking_adapter.py   optional KYS/DiMP/ATOM/PrDiMP via pytracking
-  data/
-    video_dataset.py    Kinetics clip reader ([B,C,T,H,W] in [0,1])
-    prepare_3gb.py      balanced <=3 GB Kinetics index builder
-    got10k.py           GOT-10k reader (clips + boxes, whole sequences)
-    prepare_got10k.py   <=3 GB GOT-10k index builder (val split)
-  codecs/standard.py    ffmpeg H.264 / H.265 anchors (real bpp)
-  metrics/
-    bd_rate.py          BD-Rate / BD-accuracy
-    accuracy.py         top-k
-    tracking_auc.py     success-plot AUC / AO / SR
-  losses.py             α(L_D + λL_R) + L_Acc
-  engine.py             train / eval loops (dispatched per task)
-configs/                action_recognition.yaml, tracking.yaml
-train.py  evaluate.py   CLI entry points
-scripts/install_pytracking.sh   optional pytracking setup
-kaggle/                 one-shot Kaggle driver + notebook
+  models/preprocessor.py   two-branch residual preprocessor (trained)
+  models/codec.py          CompressAI proxy (khả vi + range coder)
+  codecs/standard.py       ffmpeg H.264/H.265 — anchor VÀ nhánh x265 lúc train (qp per-call)
+  tasks/                   r3d_18 (AR), SiamFC + pytracking adapter (tracking)
+  data/                    Kinetics + GOT-10k readers, index builders (≤3GB)
+  metrics/                 BD-Rate / top-k / tracking AUC
+  losses.py                α(L_D + λL_R) + L_Acc  (KHÔNG đổi)
+  engine.py                train/eval + STE (_straight_through, _training_codec_*)
+configs/                   action_recognition.yaml, tracking.yaml
+tests/test_ste.py          STE self-check
+train.py  evaluate.py      CLI
+kaggle/                    one-shot driver + notebook
+IMPLEMENTATION_PLAN.md     kế hoạch STE cho Codex   PAPER_PLAN.md  roadmap Q1
 ```
-
-## Quickstart (local)
-
-```bash
-pip install -r requirements.txt          # needs ffmpeg (libx264+libx265) on PATH
-
-# --- action recognition (Kinetics) ---
-# 1) build a <=3GB balanced index from a Kinetics-style dir
-python -m src.data.prepare_3gb --root /path/to/kinetics --out data/index/kinetics_3gb.json --cap-gb 3
-# 2) train the preprocessor
-python train.py --config configs/action_recognition.yaml
-# 3) evaluate prep+CompressAI vs CompressAI / bare H.264 / H.265
-python evaluate.py --config configs/action_recognition.yaml \
-    --ckpt outputs/checkpoints/preprocessor.pth
-
-# --- object tracking (GOT-10k val) ---
-# 1) build a <=3GB GOT-10k index (whole sequences, train/val split)
-python -m src.data.prepare_got10k --root /path/to/got10k/val --out data/index/got10k_3gb.json --cap-gb 3
-# 2) train, then 3) evaluate real success AUC + BD-Rate
-python train.py    --config configs/tracking.yaml
-python evaluate.py --config configs/tracking.yaml --ckpt outputs/checkpoints/preprocessor.pth
-```
-
-## Quickstart (Kaggle)
-
-See [`kaggle/README.md`](kaggle/README.md). In short:
-
-```python
-!git clone https://github.com/wagur1/preprocessing_final.git
-%cd preprocessing_final
-!pip install -q compressai
-!python kaggle/run_kaggle.py --cap-gb 3 --epochs 3 --max-steps 300
-```
-
-Dataset: [`rohanmallick/kinetics-train-5per`](https://www.kaggle.com/datasets/rohanmallick/kinetics-train-5per)
-(Kinetics-400, 5%). The 3 GB cap is enforced by *indexing* (round-robin across
-classes), not copying.
 
 ## Notes & caveats
 
-* The codec is applied **frame-wise** (the standard CompressAI setup); all
-  temporal modelling lives in the preprocessor. This matches the paper, where
-  temporal reasoning is the preprocessor's job. (The H.264/H.265 anchors do use
-  inter-frame coding — the whole sequence is piped to ffmpeg as one video — so
-  the comparison is honest against real temporal codecs.)
-* Kinetics labels are mapped to the frozen analyzer's canonical 400-class
-  ordering (`weights.meta['categories']`), so zero-shot top-1 is meaningful
-  without any classifier fine-tuning.
-* The SiamFC tracker's backbone is frozen and only ImageNet-pretrained (no
-  tracker training), so *absolute* AUC is modest; because the same tracker is
-  used across all pipelines, the *relative* BD-Rate is the meaningful number.
-  Use pytracking for the paper's exact absolute numbers.
-* CompressAI qualities are swept at eval and sampled per-batch at train, playing
-  the role of the paper's random quantization factor.
+* Codec áp **frame-wise** (setup CompressAI chuẩn); temporal modelling ở preprocessor.
+  Anchor H.264/H.265 dùng inter-frame coding (cả sequence pipe vào ffmpeg) → so sánh sòng phẳng.
+* **Phase 2 (calibration) CHƯA implement**: đặt `calibration: rate` sẽ raise. Phase 1
+  (proxy đông cứng) là mặc định an toàn và đủ để vá W3 ở mức forward.
+* AUC tuyệt đối của SiamFC khiêm tốn (backbone chỉ ImageNet, không train tracker); BD-Rate
+  *tương đối* mới là số có nghĩa. Dùng pytracking cho số tuyệt đối của paper.
 
 ## Reference
 
-Zhao et al., *A Preprocessing Framework for Video Machine Vision under
-Compression*. This repo replaces the paper's virtual codec with CompressAI;
-it is an independent implementation, not the authors' code.
+Zhao et al., *A Preprocessing Framework for Video Machine Vision under Compression*
+(arXiv:2512.15331). Repo này là independent implementation, thay virtual codec bằng
+CompressAI và mở rộng vòng train sang x265 thật; không phải code của tác giả.
+
+
+
