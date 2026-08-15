@@ -92,10 +92,15 @@ train:
 | Action recognition (Kinetics-400) | frozen `r3d_18` | top-1 |
 | Object tracking (GOT-10k val) | frozen SiamFC; optional pytracking DiMP/ATOM/KYS/PrDiMP | success AUC (+AO, SR) |
 
-`evaluate.py` vẽ **rate-accuracy curve** với range coder thật, so 4 pipeline —
-`prep+compressai` (đề xuất), `compressai` (ablation), `h264`, `h265` (anchor) — rồi
-báo **BD-Rate** của `prep+compressai` vs từng anchor (âm = tiết kiệm bit ở cùng accuracy).
-Output: `results.json`, `curves.csv`, `rate_accuracy.png`. **Eval không đổi** so với baseline.
+`evaluate.py` vẽ **rate-accuracy curve** với range coder thật, so các pipeline —
+`prep+compressai` (đề xuất), `compressai` (ablation), `h264`, `h265` (anchor), và
+**`prep+h264` / `prep+h265`** (preprocessor + codec thật) — rồi báo **BD-Rate** (âm =
+tiết kiệm bit ở cùng accuracy). Hai nhóm số:
+- `bd_vs_anchor`: `prep+compressai` vs từng anchor (tham khảo, khác codec).
+- `bd_prep_gain`: **cùng codec, chỉ khác có/không preprocessor** — `prep+h265 vs h265`,
+  `prep+h264 vs h264`, `prep+compressai vs compressai`. **Đây mới là số đúng luận điểm**
+  (khớp codec bạn train-through qua STE).
+Output: `results.json`, `curves.csv`, `rate_accuracy.png`.
 
 ## Chạy trên Kaggle (cụ thể)
 

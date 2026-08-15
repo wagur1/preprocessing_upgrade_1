@@ -437,6 +437,9 @@ def _evaluate_classification(cfg, pre, codec, analyzer, out_dir) -> dict:
                     xh, bpp = sc.compress_decompress(clips)
                     s, n = _task_metric(analyzer, xh.to(device), labels)
                     _accumulate(store, name, qp, bpp, s, n)
+                    xhp, bppp = sc.compress_decompress(x_pre)   # prep + real codec
+                    sp, np_ = _task_metric(analyzer, xhp.to(device), labels)
+                    _accumulate(store, f"prep+{name}", qp, bppp, sp, np_)
 
     curves = {m: _curve(store[m]) for m in store}
     return _finalize(curves, out_dir, task="action_recognition", metric="top1",
@@ -456,6 +459,16 @@ def _codec_chunked(pre, codec, clip, q, chunk, use_pre):
         outs.append(xh)
         bpp_sum += bpp * sub.shape[2]
     return torch.cat(outs, dim=2), bpp_sum / max(t, 1)
+
+
+def _pre_chunked(pre, clip, chunk):
+    """Preprocess a long clip in T-chunks, return the full [B,C,T,H,W] (bounds memory)."""
+    t = clip.shape[2]
+    outs = []
+    for s in range(0, t, chunk):
+        with torch.no_grad():
+            outs.append(pre(clip[:, :, s : s + chunk]))
+    return torch.cat(outs, dim=2)
 
 
 def _acc_track(store, method, key, bpp, pred, gt, valid):
@@ -530,11 +543,14 @@ def _evaluate_tracking(cfg, pre, codec, analyzer, out_dir) -> dict:
             xh0, bpp0 = _codec_chunked(pre, codec, clip, q, chunk, use_pre=False)
             _acc_track(store, "compressai", q, bpp0, track(xh0, init), gt, valid)
         if have_ffmpeg:
+            clip_pre = _pre_chunked(pre, clip, chunk)   # prep once, reuse per QP
             for cname in ("h264", "h265"):
                 for qp in qps:
                     sc = StandardCodec(codec=cname, qp=qp, preset=ev.get("preset", "medium"))
                     xh, bpp = sc.compress_decompress(clip)
                     _acc_track(store, cname, qp, bpp, track(xh.to(device), init), gt, valid)
+                    xhp, bppp = sc.compress_decompress(clip_pre)   # prep + real codec
+                    _acc_track(store, f"prep+{cname}", qp, bppp, track(xhp.to(device), init), gt, valid)
 
     curves = {m: _curve_track(store[m]) for m in store}
     return _finalize(curves, out_dir, task="tracking", metric="auc", n_eval=len(seqs))
@@ -543,27 +559,40 @@ def _evaluate_tracking(cfg, pre, codec, analyzer, out_dir) -> dict:
 # --------------------------------------------------------------------------
 # finalize: BD-Rate, save, plot, print (shared by both tasks)
 # --------------------------------------------------------------------------
+def _bd_pair(curves: dict, test_name: str, anchor_name: str):
+    """BD-Rate / BD-accuracy of test curve vs anchor curve (None if either absent)."""
+    if test_name not in curves or anchor_name not in curves:
+        return None
+    a, t = curves[anchor_name], curves[test_name]
+    return {
+        "bd_rate_pct": bd_rate(a["bpp"], a["accuracy"], t["bpp"], t["accuracy"]),
+        "bd_accuracy": bd_metric(a["bpp"], a["accuracy"], t["bpp"], t["accuracy"]),
+    }
+
+
 def _finalize(curves: dict, out_dir: Path, task: str, metric: str, n_eval: int) -> dict:
+    # legacy view: prep+compressai vs every anchor (cross-codec, for reference)
     bd = {}
-    if "prep+compressai" in curves:
-        test = curves["prep+compressai"]
-        for anchor in ("compressai", "h264", "h265"):
-            if anchor in curves:
-                bd[anchor] = {
-                    "bd_rate_pct": bd_rate(
-                        curves[anchor]["bpp"], curves[anchor]["accuracy"],
-                        test["bpp"], test["accuracy"],
-                    ),
-                    "bd_accuracy": bd_metric(
-                        curves[anchor]["bpp"], curves[anchor]["accuracy"],
-                        test["bpp"], test["accuracy"],
-                    ),
-                }
+    for anchor in ("compressai", "h264", "h265"):
+        e = _bd_pair(curves, "prep+compressai", anchor)
+        if e is not None:
+            bd[anchor] = e
+    # apples-to-apples: preprocessor gain on the SAME codec (the real claim)
+    prep_gain = {}
+    for test_name, anchor_name in (
+        ("prep+compressai", "compressai"),
+        ("prep+h264", "h264"),
+        ("prep+h265", "h265"),
+    ):
+        e = _bd_pair(curves, test_name, anchor_name)
+        if e is not None:
+            prep_gain[f"{test_name} vs {anchor_name}"] = e
     results = {
         "task": task,
         "metric": metric,
         "curves": curves,
         "bd_vs_anchor": bd,
+        "bd_prep_gain": prep_gain,
         "n_eval": n_eval,
     }
     with open(out_dir / "results.json", "w", encoding="utf-8") as f:
@@ -660,5 +689,12 @@ def _print_summary(results: dict) -> None:
         for anchor, v in results["bd_vs_anchor"].items():
             print(
                 f"  vs {anchor:12s}: BD-Rate {v['bd_rate_pct']:+.2f}%  |  "
+                f"BD-Accuracy {v['bd_accuracy']:+.4f}"
+            )
+    if results.get("bd_prep_gain"):
+        print("\n=== preprocessor gain, SAME codec (the real claim; negative = savings) ===")
+        for label, v in results["bd_prep_gain"].items():
+            print(
+                f"  {label:28s}: BD-Rate {v['bd_rate_pct']:+.2f}%  |  "
                 f"BD-Accuracy {v['bd_accuracy']:+.4f}"
             )
