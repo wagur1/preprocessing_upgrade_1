@@ -261,6 +261,8 @@ def _train_classification(cfg: dict) -> str:
         if max_steps and step >= max_steps:
             break
         torch.save({"model": pre.state_dict(), "cfg": cfg, "epoch": epoch + 1}, ckpt_path)
+    # final save: guarantees a checkpoint even when max_steps stops mid-epoch
+    torch.save({"model": pre.state_dict(), "cfg": cfg, "epoch": epoch + 1}, ckpt_path)
     print(f"[train] saved checkpoint -> {ckpt_path}")
     return str(ckpt_path)
 
@@ -340,6 +342,8 @@ def _train_tracking(cfg: dict) -> str:
         if max_steps and step >= max_steps:
             break
         torch.save({"model": pre.state_dict(), "cfg": cfg, "epoch": epoch + 1}, ckpt_path)
+    # final save: guarantees a checkpoint even when max_steps stops mid-epoch
+    torch.save({"model": pre.state_dict(), "cfg": cfg, "epoch": epoch + 1}, ckpt_path)
     print(f"[train] saved checkpoint -> {ckpt_path}")
     return str(ckpt_path)
 
