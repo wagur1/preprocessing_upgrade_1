@@ -55,10 +55,13 @@ class StandardCodec:
         self.fps = fps
 
     # -- single clip -------------------------------------------------------
-    def _encode_decode_clip(self, clip: np.ndarray) -> Tuple[np.ndarray, float]:
+    def _encode_decode_clip(
+        self, clip: np.ndarray, qp: int | None = None
+    ) -> Tuple[np.ndarray, float]:
         """clip: [T,H,W,C] uint8 RGB. Returns (recon [T,H,W,C] uint8, bpp)."""
         t, h, w, c = clip.shape
         assert c == 3
+        qp = self.qp if qp is None else qp
         with tempfile.TemporaryDirectory() as td:
             bitstream = Path(td) / f"clip.{'264' if self.codec == 'h264' else '265'}"
 
@@ -69,7 +72,7 @@ class StandardCodec:
                     "-f", "rawvideo", "-pix_fmt", "rgb24",
                     "-s", f"{w}x{h}", "-r", str(self.fps), "-i", "pipe:0",
                     "-c:v", _ENCODER[self.codec],
-                    "-preset", self.preset, "-qp", str(self.qp),
+                    "-preset", self.preset, "-qp", str(qp),
                     "-pix_fmt", "yuv420p",
                     "-f", _ENCODER[self.codec].replace("libx", ""),
                     str(bitstream),
@@ -109,15 +112,17 @@ class StandardCodec:
 
     # -- batch of clips ----------------------------------------------------
     @torch.no_grad()
-    def compress_decompress(self, x: torch.Tensor) -> Tuple[torch.Tensor, float]:
-        """x: [B,C,T,H,W] in [0,1]. Returns (x_hat [B,C,T,H,W] in [0,1], mean bpp)."""
+    def compress_decompress(
+        self, x: torch.Tensor, qp: int | None = None
+    ) -> Tuple[torch.Tensor, float]:
+        """Encode a batch, optionally overriding the configured QP for this call."""
         b, c, t, h, w = x.shape
         arr = (x.clamp(0, 1) * 255).round().byte().cpu().numpy()  # [B,C,T,H,W]
         recons = []
         bpps = []
         for i in range(b):
             clip = np.transpose(arr[i], (1, 2, 3, 0))  # [T,H,W,C]
-            rec, bpp = self._encode_decode_clip(clip)
+            rec, bpp = self._encode_decode_clip(clip, qp=qp)
             recons.append(np.transpose(rec, (3, 0, 1, 2)))  # [C,T,H,W]
             bpps.append(bpp)
         out = torch.from_numpy(np.stack(recons)).float().div_(255.0).to(x.device)

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import random
+import warnings
 from pathlib import Path
 from typing import Dict, List
 
@@ -85,6 +86,92 @@ def _ckpt_path(cfg: dict) -> Path:
     return d / "preprocessor.pth"
 
 
+def _straight_through(proxy: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
+    """Use the real value in forward while retaining the proxy gradient."""
+    return proxy + (real - proxy).detach()
+
+
+def _training_codec_setup(tr: dict, codec: CompressAICodec):
+    calibration = tr.get("calibration", "none")
+    if calibration not in (None, "none"):
+        raise ValueError(
+            "train.calibration requires the optional trainable-proxy Phase 2; "
+            "use 'none' for the frozen-proxy STE path"
+        )
+
+    real_requested = bool(tr.get("real_codec", False))
+    qp_list = [int(qp) for qp in tr.get("qp_list", codec.qualities)]
+    if not qp_list:
+        raise ValueError("train.qp_list must contain at least one QP")
+
+    raw_mapping = tr.get("qp_to_quality")
+    if raw_mapping is None:
+        if real_requested:
+            raise ValueError("train.qp_to_quality is required when train.real_codec=true")
+        qp_to_quality = {q: q for q in qp_list}
+    else:
+        qp_to_quality = {int(qp): int(q) for qp, q in raw_mapping.items()}
+
+    missing = [qp for qp in qp_list if qp not in qp_to_quality]
+    if missing:
+        raise ValueError(f"train.qp_to_quality is missing QPs: {missing}")
+    unavailable = sorted(
+        {qp_to_quality[qp] for qp in qp_list} - set(codec.qualities)
+    )
+    if unavailable:
+        raise ValueError(
+            f"proxy qualities {unavailable} are not configured in codec.qualities"
+        )
+
+    if raw_mapping is not None:
+        ordered_qualities = [qp_to_quality[qp] for qp in sorted(qp_list)]
+        if any(a < b for a, b in zip(ordered_qualities, ordered_qualities[1:])):
+            raise ValueError(
+                "train.qp_to_quality must be monotonic: "
+                "higher QP maps to lower quality"
+            )
+
+    every = int(tr.get("real_codec_every_n_steps", 1))
+    if every < 1:
+        raise ValueError("train.real_codec_every_n_steps must be >= 1")
+
+    real_codec = None
+    if real_requested:
+        if ffmpeg_available():
+            real_codec = StandardCodec(
+                codec=tr.get("real_codec_name", "h265"),
+                preset=tr.get("real_codec_preset", "medium"),
+            )
+        else:
+            warnings.warn(
+                "ffmpeg/ffprobe not found; disabling real-codec training and "
+                "falling back to the differentiable proxy",
+                RuntimeWarning,
+            )
+    return qp_list, qp_to_quality, every, real_codec
+
+
+def _training_codec_forward(
+    x_pre: torch.Tensor,
+    proxy_codec: CompressAICodec,
+    quality: int,
+    real_codec: StandardCodec | None,
+    qp: int,
+    real_step: bool,
+):
+    x_hat_prx, bpp_prx = proxy_codec(x_pre, quality)
+    if real_codec is None or not real_step:
+        return x_hat_prx, bpp_prx, None
+
+    x_hat_real, bpp_real = real_codec.compress_decompress(x_pre, qp=qp)
+    bpp_real_t = torch.as_tensor(
+        bpp_real, device=x_pre.device, dtype=bpp_prx.dtype
+    )
+    x_hat = _straight_through(x_hat_prx, x_hat_real)
+    bpp = _straight_through(bpp_prx, bpp_real_t)
+    return x_hat, bpp, (bpp_prx.detach(), bpp_real_t)
+
+
 # --------------------------------------------------------------------------
 # training (dispatch)
 # --------------------------------------------------------------------------
@@ -122,7 +209,7 @@ def _train_classification(cfg: dict) -> str:
     opt = _optimizer(pre, tr)
     epochs = tr.get("epochs", 5)
     max_steps = tr.get("max_steps", None)
-    qualities = codec.qualities
+    qp_list, qp_to_quality, real_every, real_codec = _training_codec_setup(tr, codec)
     ckpt_path = _ckpt_path(cfg)
     print(
         f"[train] action_recognition | {len(ds)} clips | {len(loader)} steps/epoch "
@@ -131,10 +218,19 @@ def _train_classification(cfg: dict) -> str:
     )
 
     step = 0
+    for epoch in range(epochs):
+        pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}")
+        for clips, labels in pbar:
+            clips = clips.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
+            qp = random.choice(qp_list)
+            q = qp_to_quality[qp]
             x_pre = pre(clips)
-            q = random.choice(qualities)
-            x_hat, bpp = codec(x_pre, q)
+            real_step = real_codec is not None and step % real_every == 0
+            x_hat, bpp, rate_pair = _training_codec_forward(
+                x_pre, codec, q, real_codec, qp, real_step
+            )
 
             acc_loss, _ = analyzer.accuracy_loss(x_hat, labels)
             parts = rate_distortion_accuracy_loss(clips, x_hat, bpp, acc_loss, weights)
@@ -143,12 +239,21 @@ def _train_classification(cfg: dict) -> str:
             parts["loss"].backward()
             opt.step()
 
+            if rate_pair is not None and step % 200 == 0:
+                bpp_prx, bpp_real = (v.item() for v in rate_pair)
+                rel_gap = abs(bpp_prx - bpp_real) / max(abs(bpp_real), 1e-8)
+                tqdm.write(
+                    f"[train] step={step} qp={qp} q={q} "
+                    f"bpp_proxy={bpp_prx:.4f} bpp_real={bpp_real:.4f} "
+                    f"gap={rel_gap:.1%}"
+                )
             step += 1
             pbar.set_postfix(
                 loss=f"{parts['loss'].item():.3f}",
                 d=f"{parts['loss_distortion'].item():.4f}",
                 bpp=f"{parts['loss_rate'].item():.3f}",
                 acc=f"{parts['loss_acc'].item():.3f}",
+                qp=qp,
                 q=q,
             )
             if max_steps and step >= max_steps:
@@ -188,7 +293,7 @@ def _train_tracking(cfg: dict) -> str:
     opt = _optimizer(pre, tr)
     epochs = tr.get("epochs", 5)
     max_steps = tr.get("max_steps", None)
-    qualities = codec.qualities
+    qp_list, qp_to_quality, real_every, real_codec = _training_codec_setup(tr, codec)
     ckpt_path = _ckpt_path(cfg)
 
     step = 0
@@ -198,9 +303,13 @@ def _train_tracking(cfg: dict) -> str:
             clips = clips.to(device, non_blocking=True)
             boxes = boxes.to(device, non_blocking=True)
 
+            qp = random.choice(qp_list)
+            q = qp_to_quality[qp]
             x_pre = pre(clips)
-            q = random.choice(qualities)
-            x_hat, bpp = codec(x_pre, q)
+            real_step = real_codec is not None and step % real_every == 0
+            x_hat, bpp, rate_pair = _training_codec_forward(
+                x_pre, codec, q, real_codec, qp, real_step
+            )
 
             acc_loss, _ = analyzer.accuracy_loss(x_hat, {"boxes": boxes})
             parts = rate_distortion_accuracy_loss(clips, x_hat, bpp, acc_loss, weights)
@@ -209,12 +318,21 @@ def _train_tracking(cfg: dict) -> str:
             parts["loss"].backward()
             opt.step()
 
+            if rate_pair is not None and step % 200 == 0:
+                bpp_prx, bpp_real = (v.item() for v in rate_pair)
+                rel_gap = abs(bpp_prx - bpp_real) / max(abs(bpp_real), 1e-8)
+                tqdm.write(
+                    f"[train] step={step} qp={qp} q={q} "
+                    f"bpp_proxy={bpp_prx:.4f} bpp_real={bpp_real:.4f} "
+                    f"gap={rel_gap:.1%}"
+                )
             step += 1
             pbar.set_postfix(
                 loss=f"{parts['loss'].item():.3f}",
                 d=f"{parts['loss_distortion'].item():.4f}",
                 bpp=f"{parts['loss_rate'].item():.3f}",
                 acc=f"{parts['loss_acc'].item():.3f}",
+                qp=qp,
                 q=q,
             )
             if max_steps and step >= max_steps:

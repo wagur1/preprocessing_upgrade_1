@@ -16,7 +16,7 @@ model:                    # neural preprocessor
 
 codec:                    # CompressAI proxy (replaces the paper's virtual codec)
   model: bmshj2018-factorized
-  qualities: [1, 3, 5, 8] # rate points swept at eval; sampled per-batch at train
+  qualities: [1, 2, 3, 5, 8] # includes every quality used by qp_to_quality
 
 data:
   index: data/index/kinetics_3gb.json
@@ -32,6 +32,13 @@ train:
   lr: 1.0e-4
   alpha: 10.0             # paper: weight on (distortion + lambda*rate)
   lam: 0.001              # paper: lambda (rate weight)
+  real_codec: true
+  real_codec_name: h265   # h264 | h265
+  real_codec_preset: medium
+  qp_list: [22, 27, 32, 37, 42]
+  qp_to_quality: {22: 8, 27: 5, 32: 3, 37: 2, 42: 1}
+  real_codec_every_n_steps: 1
+  calibration: none       # none (Phase 1) | rate (Phase 2, not implemented)
 
 eval:
   batch_size: 4
