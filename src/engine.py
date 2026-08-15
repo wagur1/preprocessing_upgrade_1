@@ -409,6 +409,8 @@ def _evaluate_classification(cfg, pre, codec, analyzer, out_dir) -> dict:
         print("[eval] WARNING: ffmpeg not found -> skipping H.264/H.265 anchors")
 
     store: dict = {}
+    qmid = codec.qualities[len(codec.qualities) // 2]
+    saved_vis = False
     for clips, labels in tqdm(loader, desc="eval"):
         clips = clips.to(device)
         labels = labels.to(device)
@@ -418,6 +420,9 @@ def _evaluate_classification(cfg, pre, codec, analyzer, out_dir) -> dict:
             xh, bpp = codec.compress_decompress(x_pre, q)
             s, n = _task_metric(analyzer, xh, labels)
             _accumulate(store, "prep+compressai", q, bpp, s, n)
+            if not saved_vis and q == qmid:
+                _save_qualitative(out_dir / "qualitative.png", clips, x_pre, xh)
+                saved_vis = True
             xh0, bpp0 = codec.compress_decompress(clips, q)
             s0, n0 = _task_metric(analyzer, xh0, labels)
             _accumulate(store, "compressai", q, bpp0, s0, n0)
@@ -605,6 +610,40 @@ def _plot(path: Path, curves: dict, metric: str) -> None:
     plt.tight_layout()
     plt.savefig(path, dpi=130)
     plt.close()
+
+
+def _save_qualitative(path, source, x_pre, x_hat, n_frames: int = 4) -> None:
+    """Grid PNG: rows = source / preprocessed / reconstructed, cols = sampled
+    frames of batch item 0. Lets you eye what the preprocessor actually edits."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:  # pragma: no cover
+        print(f"[eval] qualitative viz skipped ({e})")
+        return
+    t = source.shape[2]
+    idx = torch.linspace(0, t - 1, min(n_frames, t)).round().long().tolist()
+    rows = [("source", source), ("preprocessed", x_pre), ("recon", x_hat)]
+    fig, axes = plt.subplots(
+        len(rows), len(idx), figsize=(3 * len(idx), 3 * len(rows)), squeeze=False
+    )
+    for r, (name, ten) in enumerate(rows):
+        for c, fi in enumerate(idx):
+            img = ten[0, :, fi].clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+            ax = axes[r][c]
+            ax.imshow(img)
+            ax.set_xticks([]); ax.set_yticks([])
+            if c == 0:
+                ax.set_ylabel(name, fontsize=11)
+            if r == 0:
+                ax.set_title(f"frame {fi}", fontsize=9)
+    fig.suptitle("Qualitative: source vs preprocessed vs reconstructed")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    print(f"[eval] wrote {path}")
 
 
 def _print_summary(results: dict) -> None:
