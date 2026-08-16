@@ -24,6 +24,8 @@ model:
   feat_ch: 32
   n_blocks: 3
   res_scale: 1.0
+  cond_dim: 1             # rate-condition width (1 = normalised QP; FiLM input)
+  qp_ref: [20, 51]        # QP range mapped to the [0,1] condition level
 
 codec:
   model: bmshj2018-factorized
@@ -45,8 +47,9 @@ train:
   lr: 1.0e-4
   alpha: 10.0
   lam: 0.001
-  real_codec: true
-  real_codec_name: h265   # h264 | h265
+  real_codec: false        # STE deprecated (incoherent proxy-grad vs x265-forward);
+                           # replaced by a distilled differentiable x265 emulator (roadmap).
+  real_codec_name: h265   # h264 | h265  (only used if real_codec: true)
   real_codec_preset: medium
   qp_list: [22, 27, 32, 37, 42]
   qp_to_quality: {22: 5, 27: 3, 32: 2, 37: 1, 42: 1}   # tuned so proxy bpp ~ x265 bpp

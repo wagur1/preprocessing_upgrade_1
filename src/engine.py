@@ -65,6 +65,7 @@ def _build_models(cfg: dict, device: torch.device):
         feat_ch=m.get("feat_ch", 32),
         n_blocks=m.get("n_blocks", 3),
         res_scale=m.get("res_scale", 1.0),
+        cond_dim=m.get("cond_dim", 1),
     ).to(device)
     codec = CompressAICodec(
         model=cfg["codec"].get("model", "bmshj2018-factorized"),
@@ -89,6 +90,30 @@ def _ckpt_path(cfg: dict) -> Path:
 def _straight_through(proxy: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
     """Use the real value in forward while retaining the proxy gradient."""
     return proxy + (real - proxy).detach()
+
+
+# --------------------------------------------------------------------------
+# rate conditioning: the operating point fed to the preprocessor's FiLM
+# --------------------------------------------------------------------------
+def _qp_norm(qp: float, cfg: dict) -> float:
+    """Map an x26x QP to a normalised compression level in [0, 1] (1 = most
+    compressed). ``model.qp_ref`` sets the reference range spanning train+eval."""
+    lo, hi = cfg["model"].get("qp_ref", [20, 51])
+    return min(max((float(qp) - lo) / (hi - lo), 0.0), 1.0)
+
+
+def _quality_level(quality: int, codec: CompressAICodec) -> float:
+    """Normalised compression level in [0, 1] for a CompressAI quality index
+    (higher quality index = higher rate = *less* compression -> lower level)."""
+    quals = sorted(codec.qualities)
+    span = max(quals[-1] - quals[0], 1)
+    return 1.0 - (quality - quals[0]) / span
+
+
+def _rate_cond(level: float, batch: int, device, dtype) -> torch.Tensor:
+    """Build the [B, cond_dim] condition vector. Currently a single normalised
+    rate level; append a log target-rate here for explicit rate control."""
+    return torch.full((batch, 1), float(level), device=device, dtype=dtype)
 
 
 def _training_codec_setup(tr: dict, codec: CompressAICodec):
@@ -226,7 +251,8 @@ def _train_classification(cfg: dict) -> str:
 
             qp = random.choice(qp_list)
             q = qp_to_quality[qp]
-            x_pre = pre(clips)
+            cond = _rate_cond(_qp_norm(qp, cfg), clips.shape[0], clips.device, clips.dtype)
+            x_pre = pre(clips, cond)
             real_step = real_codec is not None and step % real_every == 0
             x_hat, bpp, rate_pair = _training_codec_forward(
                 x_pre, codec, q, real_codec, qp, real_step
@@ -307,7 +333,8 @@ def _train_tracking(cfg: dict) -> str:
 
             qp = random.choice(qp_list)
             q = qp_to_quality[qp]
-            x_pre = pre(clips)
+            cond = _rate_cond(_qp_norm(qp, cfg), clips.shape[0], clips.device, clips.dtype)
+            x_pre = pre(clips, cond)
             real_step = real_codec is not None and step % real_every == 0
             x_hat, bpp, rate_pair = _training_codec_forward(
                 x_pre, codec, q, real_codec, qp, real_step
@@ -418,9 +445,12 @@ def _evaluate_classification(cfg, pre, codec, analyzer, out_dir) -> dict:
     for clips, labels in tqdm(loader, desc="eval"):
         clips = clips.to(device)
         labels = labels.to(device)
-        with torch.no_grad():
-            x_pre = pre(clips)
+        # Rate-conditioned: the preprocessor output depends on the operating
+        # point, so it is recomputed per rate point (cannot preprocess once).
         for q in codec.qualities:
+            cond = _rate_cond(_quality_level(q, codec), clips.shape[0], clips.device, clips.dtype)
+            with torch.no_grad():
+                x_pre = pre(clips, cond)
             xh, bpp = codec.compress_decompress(x_pre, q)
             s, n = _task_metric(analyzer, xh, labels)
             _accumulate(store, "prep+compressai", q, bpp, s, n)
@@ -433,6 +463,9 @@ def _evaluate_classification(cfg, pre, codec, analyzer, out_dir) -> dict:
         if have_ffmpeg:
             for name in ("h264", "h265"):
                 for qp in qps:
+                    cond = _rate_cond(_qp_norm(qp, cfg), clips.shape[0], clips.device, clips.dtype)
+                    with torch.no_grad():
+                        x_pre = pre(clips, cond)
                     sc = StandardCodec(codec=name, qp=qp, preset=ev.get("preset", "medium"))
                     xh, bpp = sc.compress_decompress(clips)
                     s, n = _task_metric(analyzer, xh.to(device), labels)
@@ -447,27 +480,27 @@ def _evaluate_classification(cfg, pre, codec, analyzer, out_dir) -> dict:
 
 
 # -- tracking eval ---------------------------------------------------------
-def _codec_chunked(pre, codec, clip, q, chunk, use_pre):
+def _codec_chunked(pre, codec, clip, q, chunk, use_pre, cond=None):
     """Run preprocessor+CompressAI over a long clip in T-chunks (bounds memory)."""
     b, c, t, h, w = clip.shape
     outs, bpp_sum = [], 0.0
     for s in range(0, t, chunk):
         sub = clip[:, :, s : s + chunk]
         with torch.no_grad():
-            xp = pre(sub) if use_pre else sub
+            xp = pre(sub, cond) if use_pre else sub
             xh, bpp = codec.compress_decompress(xp, q)
         outs.append(xh)
         bpp_sum += bpp * sub.shape[2]
     return torch.cat(outs, dim=2), bpp_sum / max(t, 1)
 
 
-def _pre_chunked(pre, clip, chunk):
+def _pre_chunked(pre, clip, chunk, cond=None):
     """Preprocess a long clip in T-chunks, return the full [B,C,T,H,W] (bounds memory)."""
     t = clip.shape[2]
     outs = []
     for s in range(0, t, chunk):
         with torch.no_grad():
-            outs.append(pre(clip[:, :, s : s + chunk]))
+            outs.append(pre(clip[:, :, s : s + chunk], cond))
     return torch.cat(outs, dim=2)
 
 
@@ -537,15 +570,18 @@ def _evaluate_tracking(cfg, pre, codec, analyzer, out_dir) -> dict:
     for name, clip, gt, valid in tqdm(seqs, desc="eval-track"):
         clip = clip.to(device)
         init = gt[0]
+        # Rate-conditioned: preprocess per operating point (output depends on it).
         for q in codec.qualities:
-            xh, bpp = _codec_chunked(pre, codec, clip, q, chunk, use_pre=True)
+            cond = _rate_cond(_quality_level(q, codec), clip.shape[0], clip.device, clip.dtype)
+            xh, bpp = _codec_chunked(pre, codec, clip, q, chunk, use_pre=True, cond=cond)
             _acc_track(store, "prep+compressai", q, bpp, track(xh, init), gt, valid)
             xh0, bpp0 = _codec_chunked(pre, codec, clip, q, chunk, use_pre=False)
             _acc_track(store, "compressai", q, bpp0, track(xh0, init), gt, valid)
         if have_ffmpeg:
-            clip_pre = _pre_chunked(pre, clip, chunk)   # prep once, reuse per QP
             for cname in ("h264", "h265"):
                 for qp in qps:
+                    cond = _rate_cond(_qp_norm(qp, cfg), clip.shape[0], clip.device, clip.dtype)
+                    clip_pre = _pre_chunked(pre, clip, chunk, cond=cond)  # prep at this QP
                     sc = StandardCodec(codec=cname, qp=qp, preset=ev.get("preset", "medium"))
                     xh, bpp = sc.compress_decompress(clip)
                     _acc_track(store, cname, qp, bpp, track(xh.to(device), init), gt, valid)
