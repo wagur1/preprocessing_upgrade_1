@@ -55,6 +55,11 @@ train:
   qp_to_quality: {22: 5, 27: 3, 32: 2, 37: 1, 42: 1}   # tuned so proxy bpp ~ x265 bpp
   real_codec_every_n_steps: 1
   calibration: none       # none (Phase 1) | rate (Phase 2, not implemented)
+  cosine: true            # cosine LR decay across all training steps
+  patience: 5             # early stop after N epochs w/o val-loss improvement (0 = off)
+  min_delta: 1.0e-4       # min val-loss drop that counts as an improvement
+  val_max_batches: 20     # cap val batches/epoch (bounds the early-stop probe cost)
+  resume: false           # continue from outputs/checkpoints/preprocessor_last.pth
 
 eval:
   qp_list: [30, 35, 40, 45, 50]

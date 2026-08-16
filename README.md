@@ -123,8 +123,21 @@ train:
   real_codec: false          # STE deprecated → mặc định proxy-only (coherent)
   qp_list: [22, 27, 32, 37, 42]
   qp_to_quality: {22: 5, 27: 3, 32: 2, 37: 1, 42: 1}   # đơn điệu: QP↑ ↔ quality↓
+  # điều khiển train cho real run (không phải smoke test):
+  cosine: true               # cosine LR decay trên toàn bộ step
+  patience: 5                # early-stop: dừng sau N epoch val-loss không giảm (0 = tắt)
+  min_delta: 1.0e-4          # mức giảm tối thiểu tính là "cải thiện"
+  val_max_batches: 20        # cap số batch val mỗi epoch (giới hạn chi phí đo)
+  resume: false              # train tiếp từ outputs/checkpoints/preprocessor_last.pth
 ```
 `codec.qualities = [1,2,3,5,8]` phủ mọi giá trị trong `qp_to_quality`.
+
+**Checkpoint & dừng.** `_fit` (dùng chung cho AR & tracking) mỗi epoch: đo **val-loss**
+(proxy-only, QP giữa cố định — tín hiệu coherent, rẻ), lưu `preprocessor_last.pth` (để
+`--resume`) và ghi `preprocessor.pth` = **best-val** (đây là ckpt `evaluate.py` nạp). Cosine
+LR decay bật mặc định; **early-stop** dừng khi val-loss không giảm quá `patience` epoch —
+nên không phải đoán số epoch, cứ đặt `epochs` dư rồi để nó tự dừng ở best. Nếu val split
+rỗng (cap quá nhỏ) thì bỏ qua val: train đủ epoch, `last = best`.
 
 ## Chạy trên Kaggle
 
@@ -138,12 +151,16 @@ H.264/H.265 lúc eval.
 
 # Action recognition (Kinetics 5%) — one-shot: prepare index → train → eval
 !python kaggle/run_kaggle.py --config configs/action_recognition.yaml \
-    --cap-gb 3 --epochs 3 --max-steps 300
+    --cap-gb 6 --epochs 12          # early-stop tự dừng ở best-val; --resume để train tiếp
 
 # Object tracking (GOT-10k val)
 !python kaggle/run_kaggle.py --config configs/tracking.yaml \
-    --cap-gb 3 --epochs 3 --max-steps 300 --max-seqs 30 --max-frames 48
+    --cap-gb 6 --epochs 12 --max-seqs 120 --max-frames 90
 ```
+
+Real run: bỏ `--max-steps`, đặt `--epochs` dư (early-stop lo phần dừng). Không đủ 1 session
+≤12h thì tách: session train (`preprocessor_last.pth` lưu ở Kaggle output) → session sau
+`--resume` train tiếp, hoặc `--skip-train --ckpt outputs/checkpoints/preprocessor.pth` để eval.
 
 Dataset AR: [`rohanmallick/kinetics-train-5per`](https://www.kaggle.com/datasets/rohanmallick/kinetics-train-5per).
 Cap dataset bằng *indexing* round-robin (không copy); `--cap-gb` có thể nới lên khi cần
@@ -154,6 +171,7 @@ Cap dataset bằng *indexing* round-robin (không copy); `--cap-gb` có thể n�
 ```bash
 python -m compileall src/ tests/    # bắt lỗi cú pháp
 python tests/test_film.py           # FiLM: identity lúc init + output phụ thuộc cond (cần torch)
+python tests/test_earlystop.py      # điều kiện dừng: patience/min_delta (import engine → cần torch)
 python tests/test_ste.py            # STE helper self-check (STE vẫn còn code)
 ```
 
@@ -179,8 +197,9 @@ src/
   metrics/                 BD-Rate / top-k / tracking AUC
   losses.py                α(L_D + λL_R) + L_Acc  (KHÔNG đổi)
   engine.py                train/eval + rate-cond helpers (_qp_norm/_quality_level/_rate_cond)
+                           + _fit dùng chung: cosine LR, val-loss/epoch, early-stop, resume
 configs/                   action_recognition.yaml, tracking.yaml
-tests/                     test_film.py (FiLM), test_ste.py (STE helper)
+tests/                     test_film.py (FiLM), test_earlystop.py (điều kiện dừng), test_ste.py
 train.py  evaluate.py      CLI          kaggle/  one-shot driver + notebook
 PAPER_PLAN.md              roadmap Q1   IMPLEMENTATION_PLAN.md  kế hoạch STE (cũ)
 ```

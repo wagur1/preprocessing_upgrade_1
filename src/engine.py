@@ -200,179 +200,219 @@ def _training_codec_forward(
 # --------------------------------------------------------------------------
 # training (dispatch)
 # --------------------------------------------------------------------------
+def _earlystop_update(val, best, min_delta, no_improve, patience):
+    """One val observation -> (improved, best, no_improve, stop).
+
+    A drop of at least ``min_delta`` below ``best`` counts as improvement and
+    resets the patience counter; otherwise ``no_improve`` grows and we stop once
+    it reaches ``patience`` (patience=0 disables early stopping)."""
+    if val < best - min_delta:
+        return True, val, 0, False
+    no_improve += 1
+    return False, best, no_improve, bool(patience and no_improve >= patience)
+
+
+@torch.no_grad()
+def _val_loss(pre, codec, analyzer, loader, weights, qp_list, qp_to_quality,
+              cfg, prep_batch, max_batches):
+    """Mean proxy-only training loss over the val split (coherent stop signal).
+
+    Uses a fixed mid-range QP so the signal is comparable across epochs, and the
+    differentiable proxy only (no ffmpeg) so it stays cheap."""
+    was_training = pre.training
+    pre.eval()
+    qp = qp_list[len(qp_list) // 2]
+    q = qp_to_quality[qp]
+    total, nb = 0.0, 0
+    for i, batch in enumerate(loader):
+        if max_batches and i >= max_batches:
+            break
+        clips, acc_fn = prep_batch(batch)
+        cond = _rate_cond(_qp_norm(qp, cfg), clips.shape[0], clips.device, clips.dtype)
+        x_hat, bpp = codec(pre(clips, cond), q)
+        parts = rate_distortion_accuracy_loss(clips, x_hat, bpp, acc_fn(x_hat), weights)
+        total += parts["loss"].item()
+        nb += 1
+    if was_training:
+        pre.train()
+    return total / max(nb, 1)
+
+
 def train(cfg: dict) -> str:
     if cfg["task"]["name"] == "tracking":
         return _train_tracking(cfg)
     return _train_classification(cfg)
 
 
-def _train_classification(cfg: dict) -> str:
-    device = _device(cfg)
-    pre, codec, analyzer = _build_models(cfg, device)
-    pre.train()
-
+def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
+         tag: str, n_train: int) -> str:
+    """Shared training loop: cosine LR, per-epoch val, best/last checkpoints,
+    early stopping, and resume. ``prep_batch(batch) -> (clips, acc_loss_fn)``."""
+    device = next(pre.parameters()).device
     tr = cfg["train"]
-    ds = VideoClipDataset(
-        index_json=cfg["data"]["index"],
-        split="train",
-        num_frames=cfg["data"].get("num_frames", 16),
-        frame_size=cfg["data"].get("frame_size", 128),
-        temporal_stride=cfg["data"].get("temporal_stride", 2),
-        train=True,
-    )
-    loader = DataLoader(
-        ds,
-        batch_size=tr.get("batch_size", 4),
-        shuffle=True,
-        num_workers=tr.get("num_workers", 2),
-        collate_fn=collate_clips,
-        drop_last=True,
-        pin_memory=(device.type == "cuda"),
-    )
-
     weights = LossWeights(alpha=tr.get("alpha", 10.0), lam=tr.get("lam", 0.001))
     opt = _optimizer(pre, tr)
-    epochs = tr.get("epochs", 5)
+    epochs = int(tr.get("epochs", 5))
     max_steps = tr.get("max_steps", None)
     qp_list, qp_to_quality, real_every, real_codec = _training_codec_setup(tr, codec)
-    ckpt_path = _ckpt_path(cfg)
-    print(
-        f"[train] action_recognition | {len(ds)} clips | {len(loader)} steps/epoch "
-        f"| device={device} | decoding first batch...",
-        flush=True,
-    )
 
-    step = 0
-    for epoch in range(epochs):
-        pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}")
-        for clips, labels in pbar:
-            clips = clips.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+    total_steps = len(train_loader) * epochs
+    if max_steps:
+        total_steps = min(total_steps, int(max_steps))
+    use_cosine = bool(tr.get("cosine", True))
+    sched = (torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(total_steps, 1))
+             if use_cosine else None)
+    patience = int(tr.get("patience", 0))
+    min_delta = float(tr.get("min_delta", 1e-4))
+    val_max_batches = tr.get("val_max_batches", 20)
+    ckpt_path = _ckpt_path(cfg)                    # best (what evaluate loads)
+    last_path = ckpt_path.with_name("preprocessor_last.pth")
 
+    start_epoch, step, best_val, no_improve = 0, 0, float("inf"), 0
+    if bool(tr.get("resume", False)) and last_path.exists():
+        st = torch.load(last_path, map_location=device)
+        pre.load_state_dict(st["model"])
+        if st.get("opt"):
+            opt.load_state_dict(st["opt"])
+        if sched is not None and st.get("sched"):
+            sched.load_state_dict(st["sched"])
+        start_epoch = st.get("epoch", 0)
+        step, best_val = st.get("global_step", 0), st.get("best_val", float("inf"))
+        no_improve = st.get("no_improve", 0)
+        print(f"[train] resumed {last_path} @ epoch {start_epoch}, step {step}")
+    if start_epoch >= epochs:
+        print("[train] resume: already at target epochs; nothing to do")
+        return str(ckpt_path if ckpt_path.exists() else last_path)
+
+    def _save(path, ep):
+        torch.save({"model": pre.state_dict(), "opt": opt.state_dict(),
+                    "sched": sched.state_dict() if sched is not None else None,
+                    "cfg": cfg, "epoch": ep, "global_step": step,
+                    "best_val": best_val, "no_improve": no_improve}, path)
+
+    pre.train()
+    print(f"[train] {tag} | {n_train} clips | {len(train_loader)} steps/epoch | "
+          f"val={'yes' if val_loader else 'none'} | cosine={use_cosine} | "
+          f"patience={patience or 'off'} | device={device}", flush=True)
+
+    stop, epoch = False, start_epoch
+    for epoch in range(start_epoch, epochs):
+        pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}")
+        for batch in pbar:
+            clips, acc_fn = prep_batch(batch)
             qp = random.choice(qp_list)
             q = qp_to_quality[qp]
             cond = _rate_cond(_qp_norm(qp, cfg), clips.shape[0], clips.device, clips.dtype)
-            x_pre = pre(clips, cond)
             real_step = real_codec is not None and step % real_every == 0
             x_hat, bpp, rate_pair = _training_codec_forward(
-                x_pre, codec, q, real_codec, qp, real_step
-            )
-
-            acc_loss, _ = analyzer.accuracy_loss(x_hat, labels)
-            parts = rate_distortion_accuracy_loss(clips, x_hat, bpp, acc_loss, weights)
-
+                pre(clips, cond), codec, q, real_codec, qp, real_step)
+            parts = rate_distortion_accuracy_loss(clips, x_hat, bpp, acc_fn(x_hat), weights)
             opt.zero_grad(set_to_none=True)
             parts["loss"].backward()
             opt.step()
-
+            if sched is not None:
+                sched.step()
             if rate_pair is not None and step % 200 == 0:
                 bpp_prx, bpp_real = (v.item() for v in rate_pair)
-                rel_gap = abs(bpp_prx - bpp_real) / max(abs(bpp_real), 1e-8)
-                tqdm.write(
-                    f"[train] step={step} qp={qp} q={q} "
-                    f"bpp_proxy={bpp_prx:.4f} bpp_real={bpp_real:.4f} "
-                    f"gap={rel_gap:.1%}"
-                )
+                gap = abs(bpp_prx - bpp_real) / max(abs(bpp_real), 1e-8)
+                tqdm.write(f"[train] step={step} qp={qp} bpp_proxy={bpp_prx:.4f} "
+                           f"bpp_real={bpp_real:.4f} gap={gap:.1%}")
             step += 1
-            pbar.set_postfix(
-                loss=f"{parts['loss'].item():.3f}",
-                d=f"{parts['loss_distortion'].item():.4f}",
-                bpp=f"{parts['loss_rate'].item():.3f}",
-                acc=f"{parts['loss_acc'].item():.3f}",
-                qp=qp,
-                q=q,
-            )
+            pbar.set_postfix(loss=f"{parts['loss'].item():.3f}",
+                             d=f"{parts['loss_distortion'].item():.4f}",
+                             bpp=f"{parts['loss_rate'].item():.3f}",
+                             acc=f"{parts['loss_acc'].item():.3f}",
+                             lr=f"{opt.param_groups[0]['lr']:.1e}", qp=qp)
             if max_steps and step >= max_steps:
+                stop = True
                 break
-        if max_steps and step >= max_steps:
+
+        _save(last_path, epoch + 1)
+        if val_loader is None:
+            _save(ckpt_path, epoch + 1)            # no val -> last is best
+        else:
+            vl = _val_loss(pre, codec, analyzer, val_loader, weights, qp_list,
+                           qp_to_quality, cfg, prep_batch, val_max_batches)
+            improved, best_val, no_improve, stop_es = _earlystop_update(
+                vl, best_val, min_delta, no_improve, patience)
+            print(f"[train] epoch {epoch + 1} val_loss={vl:.4f} best={best_val:.4f} "
+                  f"{'*improved' if improved else f'(no_improve={no_improve})'}", flush=True)
+            if improved:
+                _save(ckpt_path, epoch + 1)
+            elif stop_es:
+                print(f"[train] early stop: no val gain in {patience} epochs", flush=True)
+                stop = True
+        if stop:
             break
-        torch.save({"model": pre.state_dict(), "cfg": cfg, "epoch": epoch + 1}, ckpt_path)
-    # final save: guarantees a checkpoint even when max_steps stops mid-epoch
-    torch.save({"model": pre.state_dict(), "cfg": cfg, "epoch": epoch + 1}, ckpt_path)
-    print(f"[train] saved checkpoint -> {ckpt_path}")
+
+    if val_loader is None or not ckpt_path.exists():
+        _save(ckpt_path, epoch + 1)
+    print(f"[train] best checkpoint -> {ckpt_path}")
     return str(ckpt_path)
+
+
+def _train_classification(cfg: dict) -> str:
+    device = _device(cfg)
+    pre, codec, analyzer = _build_models(cfg, device)
+    tr, d = cfg["train"], cfg["data"]
+    common = dict(
+        index_json=d["index"],
+        num_frames=d.get("num_frames", 16),
+        frame_size=d.get("frame_size", 128),
+        temporal_stride=d.get("temporal_stride", 2),
+    )
+    train_ds = VideoClipDataset(split="train", train=True, **common)
+    val_ds = VideoClipDataset(split="val", train=False, **common)
+    train_loader = DataLoader(
+        train_ds, batch_size=tr.get("batch_size", 4), shuffle=True,
+        num_workers=tr.get("num_workers", 2), collate_fn=collate_clips,
+        drop_last=True, pin_memory=(device.type == "cuda"),
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=tr.get("batch_size", 4), shuffle=False,
+        num_workers=tr.get("num_workers", 2), collate_fn=collate_clips,
+    ) if len(val_ds) else None
+
+    def prep(batch):
+        clips, labels = batch
+        clips = clips.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        return clips, (lambda xh: analyzer.accuracy_loss(xh, labels)[0])
+
+    return _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep,
+                tag="action_recognition", n_train=len(train_ds))
 
 
 def _train_tracking(cfg: dict) -> str:
     device = _device(cfg)
     pre, codec, analyzer = _build_models(cfg, device)
-    pre.train()
-
-    tr = cfg["train"]
-    ds = GOT10kClipDataset(
-        index_json=cfg["data"]["index"],
-        split="train",
-        num_frames=cfg["data"].get("num_frames", 8),
-        frame_size=cfg["data"].get("frame_size", 256),
-        temporal_stride=cfg["data"].get("temporal_stride", 3),
-        train=True,
+    tr, d = cfg["train"], cfg["data"]
+    common = dict(
+        index_json=d["index"],
+        num_frames=d.get("num_frames", 8),
+        frame_size=d.get("frame_size", 256),
+        temporal_stride=d.get("temporal_stride", 3),
     )
-    loader = DataLoader(
-        ds,
-        batch_size=tr.get("batch_size", 2),
-        shuffle=True,
-        num_workers=tr.get("num_workers", 2),
-        collate_fn=collate_got10k,
-        drop_last=True,
-        pin_memory=(device.type == "cuda"),
+    train_ds = GOT10kClipDataset(split="train", train=True, **common)
+    val_ds = GOT10kClipDataset(split="val", train=False, **common)
+    train_loader = DataLoader(
+        train_ds, batch_size=tr.get("batch_size", 2), shuffle=True,
+        num_workers=tr.get("num_workers", 2), collate_fn=collate_got10k,
+        drop_last=True, pin_memory=(device.type == "cuda"),
     )
+    val_loader = DataLoader(
+        val_ds, batch_size=tr.get("batch_size", 2), shuffle=False,
+        num_workers=tr.get("num_workers", 2), collate_fn=collate_got10k,
+    ) if len(val_ds) else None
 
-    weights = LossWeights(alpha=tr.get("alpha", 10.0), lam=tr.get("lam", 0.001))
-    opt = _optimizer(pre, tr)
-    epochs = tr.get("epochs", 5)
-    max_steps = tr.get("max_steps", None)
-    qp_list, qp_to_quality, real_every, real_codec = _training_codec_setup(tr, codec)
-    ckpt_path = _ckpt_path(cfg)
+    def prep(batch):
+        clips, boxes = batch
+        clips = clips.to(device, non_blocking=True)
+        boxes = boxes.to(device, non_blocking=True)
+        return clips, (lambda xh: analyzer.accuracy_loss(xh, {"boxes": boxes})[0])
 
-    step = 0
-    for epoch in range(epochs):
-        pbar = tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}")
-        for clips, boxes in pbar:
-            clips = clips.to(device, non_blocking=True)
-            boxes = boxes.to(device, non_blocking=True)
-
-            qp = random.choice(qp_list)
-            q = qp_to_quality[qp]
-            cond = _rate_cond(_qp_norm(qp, cfg), clips.shape[0], clips.device, clips.dtype)
-            x_pre = pre(clips, cond)
-            real_step = real_codec is not None and step % real_every == 0
-            x_hat, bpp, rate_pair = _training_codec_forward(
-                x_pre, codec, q, real_codec, qp, real_step
-            )
-
-            acc_loss, _ = analyzer.accuracy_loss(x_hat, {"boxes": boxes})
-            parts = rate_distortion_accuracy_loss(clips, x_hat, bpp, acc_loss, weights)
-
-            opt.zero_grad(set_to_none=True)
-            parts["loss"].backward()
-            opt.step()
-
-            if rate_pair is not None and step % 200 == 0:
-                bpp_prx, bpp_real = (v.item() for v in rate_pair)
-                rel_gap = abs(bpp_prx - bpp_real) / max(abs(bpp_real), 1e-8)
-                tqdm.write(
-                    f"[train] step={step} qp={qp} q={q} "
-                    f"bpp_proxy={bpp_prx:.4f} bpp_real={bpp_real:.4f} "
-                    f"gap={rel_gap:.1%}"
-                )
-            step += 1
-            pbar.set_postfix(
-                loss=f"{parts['loss'].item():.3f}",
-                d=f"{parts['loss_distortion'].item():.4f}",
-                bpp=f"{parts['loss_rate'].item():.3f}",
-                acc=f"{parts['loss_acc'].item():.3f}",
-                qp=qp,
-                q=q,
-            )
-            if max_steps and step >= max_steps:
-                break
-        if max_steps and step >= max_steps:
-            break
-        torch.save({"model": pre.state_dict(), "cfg": cfg, "epoch": epoch + 1}, ckpt_path)
-    # final save: guarantees a checkpoint even when max_steps stops mid-epoch
-    torch.save({"model": pre.state_dict(), "cfg": cfg, "epoch": epoch + 1}, ckpt_path)
-    print(f"[train] saved checkpoint -> {ckpt_path}")
-    return str(ckpt_path)
+    return _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep,
+                tag="tracking", n_train=len(train_ds))
 
 
 # --------------------------------------------------------------------------

@@ -119,6 +119,10 @@ def main() -> None:
     p.add_argument("--max-seqs", type=int, default=None, help="tracking eval: cap val seqs")
     p.add_argument("--max-frames", type=int, default=None, help="tracking eval: cap frames/seq")
     p.add_argument("--out-dir", default="outputs")
+    p.add_argument("--resume", action="store_true",
+                   help="continue training from outputs/checkpoints/preprocessor_last.pth")
+    p.add_argument("--patience", type=int, default=None,
+                   help="early-stop patience in epochs (0 = off; overrides config)")
     p.add_argument("--skip-prepare", action="store_true")
     p.add_argument("--skip-train", action="store_true")
     p.add_argument("--ckpt", default=None, help="checkpoint for eval if skipping train")
@@ -165,6 +169,9 @@ def main() -> None:
     if args.max_frames is not None:
         ov.append(f"eval.max_frames={args.max_frames}")
     apply_overrides(cfg, ov)
+    cfg["train"]["resume"] = bool(args.resume)
+    if args.patience is not None:
+        cfg["train"]["patience"] = args.patience
 
     # 2) train
     ckpt = args.ckpt
