@@ -115,6 +115,11 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--lam", type=float, default=None,
+                   help="rate weight lambda (raise to make bitrate actually bite)")
+    p.add_argument("--alpha", type=float, default=None,
+                   help="weight on (MSE-to-source + lambda*rate); lower to stop "
+                        "pinning output to the source")
     p.add_argument("--frame-size", type=int, default=None)
     p.add_argument("--max-seqs", type=int, default=None, help="tracking eval: cap val seqs")
     p.add_argument("--max-frames", type=int, default=None, help="tracking eval: cap frames/seq")
@@ -172,6 +177,10 @@ def main() -> None:
     cfg["train"]["resume"] = bool(args.resume)
     if args.patience is not None:
         cfg["train"]["patience"] = args.patience
+    if args.lam is not None:
+        cfg["train"]["lam"] = args.lam
+    if args.alpha is not None:
+        cfg["train"]["alpha"] = args.alpha
 
     # 2) train
     ckpt = args.ckpt

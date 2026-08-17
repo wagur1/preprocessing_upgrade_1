@@ -162,6 +162,21 @@ Real run: bỏ `--max-steps`, đặt `--epochs` dư (early-stop lo phần dừng
 ≤12h thì tách: session train (`preprocessor_last.pth` lưu ở Kaggle output) → session sau
 `--resume` train tiếp, hoặc `--skip-train --ckpt outputs/checkpoints/preprocessor.pth` để eval.
 
+### Sweep rate-distortion (GO/NO-GO)
+
+Baseline `α=10, λ=0.001` khiến số hạng rate ≈0.2% loss → preprocessor **không bị ép nén**,
+BD-Rate dương (tốn bit hơn). Để rate thực sự cắn, sweep `--lam` (↑) và `--alpha` (↓, gỡ ràng
+buộc bám ảnh gốc), **chỉ nhìn `prep+compressai vs compressai` (in-domain)**:
+
+```python
+for lam, alpha in [(0.02, 3), (0.1, 1), (0.5, 1)]:
+    !python kaggle/run_kaggle.py --config configs/action_recognition.yaml \
+        --cap-gb 3 --epochs 8 --lam {lam} --alpha {alpha} --out-dir outputs/lam{lam}_a{alpha}
+```
+
+Âm được ở in-domain → mô hình có cửa nén, đầu tư tiếp two-residual + task-mask. Vẫn dương dù
+rate cắn mạnh → residual phẳng không thắng được RD của codec, phải đổi cấu trúc/điểm bán.
+
 Dataset AR: [`rohanmallick/kinetics-train-5per`](https://www.kaggle.com/datasets/rohanmallick/kinetics-train-5per).
 Cap dataset bằng *indexing* round-robin (không copy); `--cap-gb` có thể nới lên khi cần
 đường cong/CI chắc hơn (3 GB chỉ là mức prototype).
